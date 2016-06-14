@@ -23,10 +23,13 @@ import java.util.concurrent.TimeUnit
 import scala.collection.mutable
 
 import com.codahale.metrics.{Metric, MetricFilter, MetricRegistry}
+import org.eclipse.jetty.servlet.ServletContextHandler
 
-import org.apache.spark.{Logging, SecurityManager, SparkConf}
+import org.apache.spark.{SecurityManager, SparkConf}
+import org.apache.spark.internal.Logging
 import org.apache.spark.metrics.sink.{MetricsServlet, Sink}
-import org.apache.spark.metrics.source.Source
+import org.apache.spark.metrics.source.{Source, StaticSources}
+import org.apache.spark.util.Utils
 
 /**
  * Spark Metrics System, created by specific "instance", combined by source,
@@ -69,8 +72,7 @@ private[spark] class MetricsSystem private (
     securityMgr: SecurityManager)
   extends Logging {
 
-  private[this] val confFile = conf.get("spark.metrics.conf", null)
-  private[this] val metricsConfig = new MetricsConfig(Option(confFile))
+  private[this] val metricsConfig = new MetricsConfig(conf)
 
   private val sinks = new mutable.ArrayBuffer[Sink]
   private val sources = new mutable.ArrayBuffer[Source]
@@ -84,9 +86,9 @@ private[spark] class MetricsSystem private (
   /**
    * Get any UI handlers used by this metrics system; can only be called after start().
    */
-  def getServletHandlers = {
+  def getServletHandlers: Array[ServletContextHandler] = {
     require(running, "Can only call getServletHandlers on a running MetricsSystem")
-    metricsServlet.map(_.getHandlers).getOrElse(Array())
+    metricsServlet.map(_.getHandlers(conf)).getOrElse(Array())
   }
 
   metricsConfig.initialize()
@@ -94,6 +96,7 @@ private[spark] class MetricsSystem private (
   def start() {
     require(!running, "Attempting to start a MetricsSystem that is already running")
     running = true
+    StaticSources.allSources.foreach(registerSource)
     registerSources()
     registerSinks()
     sinks.foreach(_.start)
@@ -140,6 +143,9 @@ private[spark] class MetricsSystem private (
     } else { defaultName }
   }
 
+  def getSourcesByName(sourceName: String): Seq[Source] =
+    sources.filter(_.sourceName == sourceName)
+
   def registerSource(source: Source) {
     sources += source
     try {
@@ -166,7 +172,7 @@ private[spark] class MetricsSystem private (
     sourceConfigs.foreach { kv =>
       val classPath = kv._2.getProperty("class")
       try {
-        val source = Class.forName(classPath).newInstance()
+        val source = Utils.classForName(classPath).newInstance()
         registerSource(source.asInstanceOf[Source])
       } catch {
         case e: Exception => logError("Source class " + classPath + " cannot be instantiated", e)
@@ -182,7 +188,7 @@ private[spark] class MetricsSystem private (
       val classPath = kv._2.getProperty("class")
       if (null != classPath) {
         try {
-          val sink = Class.forName(classPath)
+          val sink = Utils.classForName(classPath)
             .getConstructor(classOf[Properties], classOf[MetricRegistry], classOf[SecurityManager])
             .newInstance(kv._2, registry, securityMgr)
           if (kv._1 == "servlet") {
@@ -191,7 +197,9 @@ private[spark] class MetricsSystem private (
             sinks += sink.asInstanceOf[Sink]
           }
         } catch {
-          case e: Exception => logError("Sink class " + classPath + " cannot be instantialized", e)
+          case e: Exception =>
+            logError("Sink class " + classPath + " cannot be instantiated")
+            throw e
         }
       }
     }

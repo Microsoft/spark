@@ -17,14 +17,14 @@
 
 package org.apache.spark.streaming.api.java
 
-import org.apache.spark.streaming.{Duration, Time}
-import org.apache.spark.api.java.function.{Function => JFunction}
-import org.apache.spark.api.java.JavaRDD
-import org.apache.spark.storage.StorageLevel
-import org.apache.spark.rdd.RDD
-
 import scala.language.implicitConversions
 import scala.reflect.ClassTag
+
+import org.apache.spark.api.java.JavaRDD
+import org.apache.spark.api.java.function.{Function => JFunction}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.streaming.{Duration, Time}
 import org.apache.spark.streaming.dstream.DStream
 
 /**
@@ -36,7 +36,7 @@ import org.apache.spark.streaming.dstream.DStream
  * [[org.apache.spark.streaming.api.java.JavaPairDStream]].
  */
 class JavaDStream[T](val dstream: DStream[T])(implicit val classTag: ClassTag[T])
-    extends JavaDStreamLike[T, JavaDStream[T], JavaRDD[T]] {
+    extends AbstractJavaDStreamLike[T, JavaDStream[T], JavaRDD[T]] {
 
   override def wrapRDD(rdd: RDD[T]): JavaRDD[T] = JavaRDD.fromRDD(rdd)
 

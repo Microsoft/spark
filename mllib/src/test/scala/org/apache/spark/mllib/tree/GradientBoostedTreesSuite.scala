@@ -17,22 +17,21 @@
 
 package org.apache.spark.mllib.tree
 
-import org.scalatest.FunSuite
-
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.configuration.Algo._
 import org.apache.spark.mllib.tree.configuration.{BoostingStrategy, Strategy}
+import org.apache.spark.mllib.tree.configuration.Algo._
 import org.apache.spark.mllib.tree.impurity.Variance
-import org.apache.spark.mllib.tree.loss.{AbsoluteError, SquaredError, LogLoss}
+import org.apache.spark.mllib.tree.loss.{AbsoluteError, LogLoss, SquaredError}
 import org.apache.spark.mllib.tree.model.GradientBoostedTreesModel
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.util.Utils
 
-
 /**
  * Test suite for [[GradientBoostedTrees]].
  */
-class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
+class GradientBoostedTreesSuite extends SparkFunSuite with MLlibTestSparkContext with Logging {
 
   test("Regression with continuous features: SquaredError") {
     GradientBoostedTreesSuite.testCombinations.foreach {
@@ -51,7 +50,7 @@ class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
           EnsembleTestHelper.validateRegressor(gbt, GradientBoostedTreesSuite.data, 0.06)
         } catch {
           case e: java.lang.AssertionError =>
-            println(s"FAILED for numIterations=$numIterations, learningRate=$learningRate," +
+            logError(s"FAILED for numIterations=$numIterations, learningRate=$learningRate," +
               s" subsamplingRate=$subsamplingRate")
             throw e
         }
@@ -81,7 +80,7 @@ class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
           EnsembleTestHelper.validateRegressor(gbt, GradientBoostedTreesSuite.data, 0.85, "mae")
         } catch {
           case e: java.lang.AssertionError =>
-            println(s"FAILED for numIterations=$numIterations, learningRate=$learningRate," +
+            logError(s"FAILED for numIterations=$numIterations, learningRate=$learningRate," +
               s" subsamplingRate=$subsamplingRate")
             throw e
         }
@@ -112,7 +111,7 @@ class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
           EnsembleTestHelper.validateClassifier(gbt, GradientBoostedTreesSuite.data, 0.9)
         } catch {
           case e: java.lang.AssertionError =>
-            println(s"FAILED for numIterations=$numIterations, learningRate=$learningRate," +
+            logError(s"FAILED for numIterations=$numIterations, learningRate=$learningRate," +
               s" subsamplingRate=$subsamplingRate")
             throw e
         }
@@ -158,12 +157,32 @@ class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
       }
     }
   }
+
+  test("Checkpointing") {
+    val tempDir = Utils.createTempDir()
+    val path = tempDir.toURI.toString
+    sc.setCheckpointDir(path)
+
+    val rdd = sc.parallelize(GradientBoostedTreesSuite.data, 2)
+
+    val treeStrategy = new Strategy(algo = Regression, impurity = Variance, maxDepth = 2,
+      categoricalFeaturesInfo = Map.empty, checkpointInterval = 2)
+    val boostingStrategy = new BoostingStrategy(treeStrategy, SquaredError, 5, 0.1)
+
+    val gbt = GradientBoostedTrees.train(rdd, boostingStrategy)
+
+    sc.checkpointDir = None
+    Utils.deleteRecursively(tempDir)
+  }
+
 }
 
-private object GradientBoostedTreesSuite {
+private[spark] object GradientBoostedTreesSuite {
 
   // Combinations for estimators, learning rates and subsamplingRate
   val testCombinations = Array((10, 1.0, 1.0), (10, 0.1, 1.0), (10, 0.5, 0.75), (10, 0.1, 0.75))
 
   val data = EnsembleTestHelper.generateOrderedLabeledPoints(numFeatures = 10, 100)
+  val trainData = EnsembleTestHelper.generateOrderedLabeledPoints(numFeatures = 20, 120)
+  val validateData = EnsembleTestHelper.generateOrderedLabeledPoints(numFeatures = 20, 80)
 }

@@ -15,11 +15,12 @@
 # limitations under the License.
 #
 
-from pyspark import SparkContext
-from pyspark.sql import SQLContext, Row
+from __future__ import print_function
+
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import HashingTF, Tokenizer
 from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.feature import HashingTF, Tokenizer
+from pyspark.sql import Row, SparkSession
 
 
 """
@@ -32,48 +33,40 @@ pipeline in Python. Run with:
 
 
 if __name__ == "__main__":
-    sc = SparkContext(appName="SimpleTextClassificationPipeline")
-    sqlCtx = SQLContext(sc)
+    spark = SparkSession\
+        .builder\
+        .appName("SimpleTextClassificationPipeline")\
+        .getOrCreate()
 
     # Prepare training documents, which are labeled.
-    LabeledDocument = Row('id', 'text', 'label')
-    training = sqlCtx.inferSchema(
-        sc.parallelize([(0L, "a b c d e spark", 1.0),
-                        (1L, "b d", 0.0),
-                        (2L, "spark f g h", 1.0),
-                        (3L, "hadoop mapreduce", 0.0)])
-          .map(lambda x: LabeledDocument(*x)))
+    training = spark.createDataFrame([
+        (0, "a b c d e spark", 1.0),
+        (1, "b d", 0.0),
+        (2, "spark f g h", 1.0),
+        (3, "hadoop mapreduce", 0.0)
+    ], ["id", "text", "label"])
 
     # Configure an ML pipeline, which consists of tree stages: tokenizer, hashingTF, and lr.
-    tokenizer = Tokenizer() \
-        .setInputCol("text") \
-        .setOutputCol("words")
-    hashingTF = HashingTF() \
-        .setInputCol(tokenizer.getOutputCol()) \
-        .setOutputCol("features")
-    lr = LogisticRegression() \
-        .setMaxIter(10) \
-        .setRegParam(0.01)
-    pipeline = Pipeline() \
-        .setStages([tokenizer, hashingTF, lr])
+    tokenizer = Tokenizer(inputCol="text", outputCol="words")
+    hashingTF = HashingTF(inputCol=tokenizer.getOutputCol(), outputCol="features")
+    lr = LogisticRegression(maxIter=10, regParam=0.001)
+    pipeline = Pipeline(stages=[tokenizer, hashingTF, lr])
 
     # Fit the pipeline to training documents.
     model = pipeline.fit(training)
 
     # Prepare test documents, which are unlabeled.
-    Document = Row('id', 'text')
-    test = sqlCtx.inferSchema(
-        sc.parallelize([(4L, "spark i j k"),
-                        (5L, "l m n"),
-                        (6L, "mapreduce spark"),
-                        (7L, "apache hadoop")])
-          .map(lambda x: Document(*x)))
+    test = spark.createDataFrame([
+        (4, "spark i j k"),
+        (5, "l m n"),
+        (6, "spark hadoop spark"),
+        (7, "apache hadoop")
+    ], ["id", "text"])
 
     # Make predictions on test documents and print columns of interest.
     prediction = model.transform(test)
-    prediction.registerTempTable("prediction")
-    selected = sqlCtx.sql("SELECT id, text, prediction from prediction")
+    selected = prediction.select("id", "text", "prediction")
     for row in selected.collect():
-        print row
+        print(row)
 
-    sc.stop()
+    spark.stop()

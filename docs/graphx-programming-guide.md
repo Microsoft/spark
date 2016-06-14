@@ -70,7 +70,7 @@ operators (e.g., [subgraph](#structural_operators), [joinVertices](#join_operato
 
 ## Migrating from Spark 1.1
 
-GraphX in Spark {{site.SPARK_VERSION}} contains a few user facing API changes:
+GraphX in Spark 1.2 contains a few user facing API changes:
 
 1. To improve performance we have introduced a new version of
 [`mapReduceTriplets`][Graph.mapReduceTriplets] called
@@ -132,7 +132,7 @@ var graph: Graph[VertexProperty, String] = null
 
 Like RDDs, property graphs are immutable, distributed, and fault-tolerant.  Changes to the values or
 structure of the graph are accomplished by producing a new graph with the desired changes.  Note
-that substantial parts of the original graph (i.e., unaffected structure, attributes, and indicies)
+that substantial parts of the original graph (i.e., unaffected structure, attributes, and indices)
 are reused in the new graph reducing the cost of this inherently functional data structure.  The
 graph is partitioned across the executors using a range of vertex partitioning heuristics.  As with
 RDDs, each partition of the graph can be recreated on a different machine in the event of a failure.
@@ -538,7 +538,7 @@ val joinedGraph = graph.joinVertices(uniqueCosts,
 
 ## Neighborhood Aggregation
 
-A key step in may graph analytics tasks is aggregating information about the neighborhood of each
+A key step in many graph analytics tasks is aggregating information about the neighborhood of each
 vertex.
 For example, we might want to know the number of followers each user has or the average age of the
 the followers of each user.  Many iterative graph algorithms (e.g., PageRank, Shortest Path, and
@@ -634,7 +634,7 @@ avgAgeOfOlderFollowers.collect.foreach(println(_))
 
 ### Map Reduce Triplets Transition Guide (Legacy)
 
-In earlier versions of GraphX we neighborhood aggregation was accomplished using the
+In earlier versions of GraphX neighborhood aggregation was accomplished using the
 [`mapReduceTriplets`][Graph.mapReduceTriplets] operator:
 
 {% highlight scala %}
@@ -663,7 +663,7 @@ val graph: Graph[Int, Float] = ...
 def msgFun(triplet: Triplet[Int, Float]): Iterator[(Int, String)] = {
   Iterator((triplet.dstId, "Hi"))
 }
-def reduceFun(a: Int, b: Int): Int = a + b
+def reduceFun(a: String, b: String): String = a + " " + b
 val result = graph.mapReduceTriplets[String](msgFun, reduceFun)
 {% endhighlight %}
 
@@ -674,7 +674,7 @@ val graph: Graph[Int, Float] = ...
 def msgFun(triplet: EdgeContext[Int, Float, String]) {
   triplet.sendToDst("Hi")
 }
-def reduceFun(a: Int, b: Int): Int = a + b
+def reduceFun(a: String, b: String): String = a + " " + b
 val result = graph.aggregateMessages[String](msgFun, reduceFun)
 {% endhighlight %}
 
@@ -682,8 +682,8 @@ val result = graph.aggregateMessages[String](msgFun, reduceFun)
 ### Computing Degree Information
 
 A common aggregation task is computing the degree of each vertex: the number of edges adjacent to
-each vertex.  In the context of directed graphs it often necessary to know the in-degree, out-
-degree, and the total degree of each vertex.  The  [`GraphOps`][GraphOps] class contains a
+each vertex.  In the context of directed graphs it is often necessary to know the in-degree, 
+out-degree, and the total degree of each vertex.  The  [`GraphOps`][GraphOps] class contains a
 collection of operators to compute the degrees of each vertex.  For example in the following we
 compute the max in, out, and total degrees:
 
@@ -768,16 +768,14 @@ class GraphOps[VD, ED] {
     // Loop until no messages remain or maxIterations is achieved
     var i = 0
     while (activeMessages > 0 && i < maxIterations) {
-      // Receive the messages: -----------------------------------------------------------------------
-      // Run the vertex program on all vertices that receive messages
-      val newVerts = g.vertices.innerJoin(messages)(vprog).cache()
-      // Merge the new vertex values back into the graph
-      g = g.outerJoinVertices(newVerts) { (vid, old, newOpt) => newOpt.getOrElse(old) }.cache()
-      // Send Messages: ------------------------------------------------------------------------------
-      // Vertices that didn't receive a message above don't appear in newVerts and therefore don't
-      // get to send messages.  More precisely the map phase of mapReduceTriplets is only invoked
-      // on edges in the activeDir of vertices in newVerts
-      messages = g.mapReduceTriplets(sendMsg, mergeMsg, Some((newVerts, activeDir))).cache()
+      // Receive the messages and update the vertices.
+      g = g.joinVertices(messages)(vprog).cache()
+      val oldMessages = messages
+      // Send new messages, skipping edges where neither side received a message. We must cache
+      // messages so it can be materialized on the next line, allowing us to uncache the previous
+      // iteration.
+      messages = g.mapReduceTriplets(
+        sendMsg, mergeMsg, Some((oldMessages, activeDirection))).cache()
       activeMessages = messages.count()
       i += 1
     }
@@ -800,7 +798,7 @@ import org.apache.spark.graphx._
 // Import random graph generation library
 import org.apache.spark.graphx.util.GraphGenerators
 // A graph with edge attributes containing distances
-val graph: Graph[Int, Double] =
+val graph: Graph[Long, Double] =
   GraphGenerators.logNormalGraph(sc, numVertices = 100).mapEdges(e => e.attr.toDouble)
 val sourceId: VertexId = 42 // The ultimate source
 // Initialize the graph such that all vertices except the root have distance infinity.
@@ -899,6 +897,8 @@ class VertexRDD[VD] extends RDD[(VertexID, VD)] {
   // Transform the values without changing the ids (preserves the internal index)
   def mapValues[VD2](map: VD => VD2): VertexRDD[VD2]
   def mapValues[VD2](map: (VertexId, VD) => VD2): VertexRDD[VD2]
+  // Show only vertices unique to this set based on their VertexId's
+  def minus(other: RDD[(VertexId, VD)])
   // Remove vertices from this set that appear in the other set
   def diff(other: VertexRDD[VD]): VertexRDD[VD]
   // Join operators that take advantage of the internal indexing to accelerate joins (substantially)
@@ -944,7 +944,7 @@ The three additional functions exposed by the `EdgeRDD` are:
 {% highlight scala %}
 // Transform the edge attributes while preserving the structure
 def mapValues[ED2](f: Edge[ED] => ED2): EdgeRDD[ED2]
-// Revere the edges reusing both attributes and structure
+// Reverse the edges reusing both attributes and structure
 def reverse: EdgeRDD[ED]
 // Join two `EdgeRDD`s partitioned using the same partitioning strategy.
 def innerJoin[ED2, ED3](other: EdgeRDD[ED2])(f: (VertexId, VertexId, ED, ED2) => ED3): EdgeRDD[ED3]

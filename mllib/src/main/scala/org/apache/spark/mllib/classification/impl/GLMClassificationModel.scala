@@ -17,10 +17,13 @@
 
 package org.apache.spark.mllib.classification.impl
 
+import org.json4s.JsonDSL._
+import org.json4s.jackson.JsonMethods._
+
 import org.apache.spark.SparkContext
 import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.mllib.util.Loader
-import org.apache.spark.sql.{DataFrame, Row, SQLContext}
+import org.apache.spark.sql.{Row, SparkSession}
 
 /**
  * Helper class for import/export of GLM classification models.
@@ -29,7 +32,7 @@ private[classification] object GLMClassificationModel {
 
   object SaveLoadV1_0 {
 
-    def thisFormatVersion = "1.0"
+    def thisFormatVersion: String = "1.0"
 
     /** Model data for import/export */
     case class Data(weights: Vector, intercept: Double, threshold: Option[Double])
@@ -48,20 +51,17 @@ private[classification] object GLMClassificationModel {
         weights: Vector,
         intercept: Double,
         threshold: Option[Double]): Unit = {
-      val sqlContext = new SQLContext(sc)
-      import sqlContext.implicits._
+      val spark = SparkSession.builder().sparkContext(sc).getOrCreate()
 
       // Create JSON metadata.
-      val metadataRDD =
-        sc.parallelize(Seq((modelClass, thisFormatVersion, numFeatures, numClasses)), 1)
-          .toDataFrame("class", "version", "numFeatures", "numClasses")
-      metadataRDD.toJSON.saveAsTextFile(Loader.metadataPath(path))
+      val metadata = compact(render(
+        ("class" -> modelClass) ~ ("version" -> thisFormatVersion) ~
+        ("numFeatures" -> numFeatures) ~ ("numClasses" -> numClasses)))
+      sc.parallelize(Seq(metadata), 1).saveAsTextFile(Loader.metadataPath(path))
 
       // Create Parquet data.
       val data = Data(weights, intercept, threshold)
-      val dataRDD: DataFrame = sc.parallelize(Seq(data), 1)
-      // TODO: repartition with 1 partition after SPARK-5532 gets fixed
-      dataRDD.saveAsParquetFile(Loader.dataPath(path))
+      spark.createDataFrame(Seq(data)).repartition(1).write.parquet(Loader.dataPath(path))
     }
 
     /**
@@ -72,13 +72,13 @@ private[classification] object GLMClassificationModel {
      * @param modelClass  String name for model class (used for error messages)
      */
     def loadData(sc: SparkContext, path: String, modelClass: String): Data = {
-      val datapath = Loader.dataPath(path)
-      val sqlContext = new SQLContext(sc)
-      val dataRDD = sqlContext.parquetFile(datapath)
+      val dataPath = Loader.dataPath(path)
+      val spark = SparkSession.builder().sparkContext(sc).getOrCreate()
+      val dataRDD = spark.read.parquet(dataPath)
       val dataArray = dataRDD.select("weights", "intercept", "threshold").take(1)
-      assert(dataArray.size == 1, s"Unable to load $modelClass data from: $datapath")
+      assert(dataArray.length == 1, s"Unable to load $modelClass data from: $dataPath")
       val data = dataArray(0)
-      assert(data.size == 3, s"Unable to load $modelClass data from: $datapath")
+      assert(data.size == 3, s"Unable to load $modelClass data from: $dataPath")
       val (weights, intercept) = data match {
         case Row(weights: Vector, intercept: Double, _) =>
           (weights, intercept)
@@ -91,5 +91,4 @@ private[classification] object GLMClassificationModel {
       Data(weights, intercept, threshold)
     }
   }
-
 }

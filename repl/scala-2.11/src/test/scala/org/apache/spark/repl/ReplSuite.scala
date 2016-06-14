@@ -21,19 +21,14 @@ import java.io._
 import java.net.URLClassLoader
 
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.Await
-import scala.concurrent.duration._
-import scala.tools.nsc.interpreter.SparkILoop
-
-import com.google.common.io.Files
-import org.scalatest.FunSuite
 import org.apache.commons.lang3.StringEscapeUtils
-import org.apache.spark.SparkContext
+import org.apache.log4j.{Level, LogManager}
+import org.apache.spark.{SparkContext, SparkFunSuite}
+import org.apache.spark.internal.config._
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.util.Utils
 
-
-
-class ReplSuite extends FunSuite {
+class ReplSuite extends SparkFunSuite {
 
   def runInterpreter(master: String, input: String): String = {
     val CONF_EXECUTOR_CLASSPATH = "spark.executor.extraClassPath"
@@ -55,14 +50,8 @@ class ReplSuite extends FunSuite {
     val oldExecutorClasspath = System.getProperty(CONF_EXECUTOR_CLASSPATH)
     System.setProperty(CONF_EXECUTOR_CLASSPATH, classpath)
 
-    System.setProperty("spark.master", master)
-    val interp = {
-      new SparkILoop(in, new PrintWriter(out))
-    }
-    org.apache.spark.repl.Main.interp = interp
-    Main.s.processArguments(List("-classpath", classpath), true)
-    Main.main(Array()) // call main
-    org.apache.spark.repl.Main.interp = null
+    Main.conf.set("spark.master", master)
+    Main.doMain(Array("-classpath", classpath), new SparkILoop(in, new PrintWriter(out)))
 
     if (oldExecutorClasspath != null) {
       System.setProperty(CONF_EXECUTOR_CLASSPATH, oldExecutorClasspath)
@@ -71,6 +60,10 @@ class ReplSuite extends FunSuite {
     }
     return out.toString
   }
+
+  // Simulate the paste mode in Scala REPL.
+  def runInterpreterInPasteMode(master: String, input: String): String =
+    runInterpreter(master, ":paste\n" + input + 4.toChar) // 4 is the ascii code of CTRL + D
 
   def assertContains(message: String, output: String) {
     val isContain = output.contains(message)
@@ -90,10 +83,6 @@ class ReplSuite extends FunSuite {
       settings = new scala.tools.nsc.Settings
       settings.usejavacp.value = true
       org.apache.spark.repl.Main.interp = this
-      override def createInterpreter() {
-        intp = new SparkILoopInterpreter
-        intp.setContextClassLoader()
-      }
     }
 
     val out = new StringWriter()
@@ -112,25 +101,71 @@ class ReplSuite extends FunSuite {
     System.clearProperty("spark.driver.port")
   }
 
+  test("SPARK-15236: use Hive catalog") {
+    // turn on the INFO log so that it is possible the code will dump INFO
+    // entry for using "HiveMetastore"
+    val rootLogger = LogManager.getRootLogger()
+    val logLevel = rootLogger.getLevel
+    rootLogger.setLevel(Level.INFO)
+    try {
+      Main.conf.set(CATALOG_IMPLEMENTATION.key, "hive")
+      val output = runInterpreter("local",
+        """
+      |spark.sql("drop table if exists t_15236")
+    """.stripMargin)
+      assertDoesNotContain("error:", output)
+      assertDoesNotContain("Exception", output)
+      // only when the config is set to hive and
+      // hive classes are built, we will use hive catalog.
+      // Then log INFO entry will show things using HiveMetastore
+      if (SparkSession.hiveClassesArePresent) {
+        assertContains("HiveMetaStore", output)
+      } else {
+        // If hive classes are not built, in-memory catalog will be used
+        assertDoesNotContain("HiveMetaStore", output)
+      }
+    } finally {
+      rootLogger.setLevel(logLevel)
+    }
+  }
+
+  test("SPARK-15236: use in-memory catalog") {
+    val rootLogger = LogManager.getRootLogger()
+    val logLevel = rootLogger.getLevel
+    rootLogger.setLevel(Level.INFO)
+    try {
+      Main.conf.set(CATALOG_IMPLEMENTATION.key, "in-memory")
+      val output = runInterpreter("local",
+        """
+          |spark.sql("drop table if exists t_16236")
+        """.stripMargin)
+      assertDoesNotContain("error:", output)
+      assertDoesNotContain("Exception", output)
+      assertDoesNotContain("HiveMetaStore", output)
+    } finally {
+      rootLogger.setLevel(logLevel)
+    }
+  }
+
   test("simple foreach with accumulator") {
     val output = runInterpreter("local",
       """
-        |val accum = sc.accumulator(0)
-        |sc.parallelize(1 to 10).foreach(x => accum += x)
+        |val accum = sc.longAccumulator
+        |sc.parallelize(1 to 10).foreach(x => accum.add(x))
         |accum.value
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
-    assertContains("res1: Int = 55", output)
+    assertContains("res1: Long = 55", output)
   }
 
   test("external vars") {
     val output = runInterpreter("local",
       """
         |var v = 7
-        |sc.parallelize(1 to 10).map(x => v).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => v).collect().reduceLeft(_+_)
         |v = 10
-        |sc.parallelize(1 to 10).map(x => v).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => v).collect().reduceLeft(_+_)
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
@@ -144,7 +179,7 @@ class ReplSuite extends FunSuite {
         |class C {
         |def foo = 5
         |}
-        |sc.parallelize(1 to 10).map(x => (new C).foo).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => (new C).foo).collect().reduceLeft(_+_)
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
@@ -155,7 +190,7 @@ class ReplSuite extends FunSuite {
     val output = runInterpreter("local",
       """
         |def double(x: Int) = x + x
-        |sc.parallelize(1 to 10).map(x => double(x)).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => double(x)).collect().reduceLeft(_+_)
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
@@ -167,9 +202,9 @@ class ReplSuite extends FunSuite {
       """
         |var v = 7
         |def getV() = v
-        |sc.parallelize(1 to 10).map(x => getV()).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => getV()).collect().reduceLeft(_+_)
         |v = 10
-        |sc.parallelize(1 to 10).map(x => getV()).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => getV()).collect().reduceLeft(_+_)
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
@@ -185,9 +220,9 @@ class ReplSuite extends FunSuite {
       """
         |var array = new Array[Int](5)
         |val broadcastArray = sc.broadcast(array)
-        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect
+        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect()
         |array(0) = 5
-        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect
+        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect()
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
@@ -196,8 +231,7 @@ class ReplSuite extends FunSuite {
   }
 
   test("interacting with files") {
-    val tempDir = Files.createTempDir()
-    tempDir.deleteOnExit()
+    val tempDir = Utils.createTempDir()
     val out = new FileWriter(tempDir + "/input")
     out.write("Hello world!\n")
     out.write("What's up?\n")
@@ -220,18 +254,18 @@ class ReplSuite extends FunSuite {
   }
 
   test("local-cluster mode") {
-    val output = runInterpreter("local-cluster[1,1,512]",
+    val output = runInterpreter("local-cluster[1,1,1024]",
       """
         |var v = 7
         |def getV() = v
-        |sc.parallelize(1 to 10).map(x => getV()).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => getV()).collect().reduceLeft(_+_)
         |v = 10
-        |sc.parallelize(1 to 10).map(x => getV()).collect.reduceLeft(_+_)
+        |sc.parallelize(1 to 10).map(x => getV()).collect().reduceLeft(_+_)
         |var array = new Array[Int](5)
         |val broadcastArray = sc.broadcast(array)
-        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect
+        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect()
         |array(0) = 5
-        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect
+        |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect()
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
@@ -242,7 +276,7 @@ class ReplSuite extends FunSuite {
   }
 
   test("SPARK-1199 two instances of same class don't type check.") {
-    val output = runInterpreter("local-cluster[1,1,512]",
+    val output = runInterpreter("local",
       """
         |case class Sum(exp: String, exp2: String)
         |val a = Sum("A", "B")
@@ -263,46 +297,71 @@ class ReplSuite extends FunSuite {
     assertDoesNotContain("Exception", output)
   }
 
-  test("SPARK-2576 importing SQLContext.createSchemaRDD.") {
+  test("SPARK-2576 importing implicits") {
     // We need to use local-cluster to test this case.
-    val output = runInterpreter("local-cluster[1,1,512]",
+    val output = runInterpreter("local-cluster[1,1,1024]",
       """
-        |val sqlContext = new org.apache.spark.sql.SQLContext(sc)
-        |import sqlContext.createSchemaRDD
+        |import spark.implicits._
         |case class TestCaseClass(value: Int)
-        |sc.parallelize(1 to 10).map(x => TestCaseClass(x)).toSchemaRDD.collect
+        |sc.parallelize(1 to 10).map(x => TestCaseClass(x)).toDF().collect()
+        |
+        |// Test Dataset Serialization in the REPL
+        |Seq(TestCaseClass(1)).toDS().collect()
+      """.stripMargin)
+    assertDoesNotContain("error:", output)
+    assertDoesNotContain("Exception", output)
+  }
+
+  test("Datasets and encoders") {
+    val output = runInterpreter("local",
+      """
+        |import org.apache.spark.sql.functions._
+        |import org.apache.spark.sql.{Encoder, Encoders}
+        |import org.apache.spark.sql.expressions.Aggregator
+        |import org.apache.spark.sql.TypedColumn
+        |val simpleSum = new Aggregator[Int, Int, Int] {
+        |  def zero: Int = 0                     // The initial value.
+        |  def reduce(b: Int, a: Int) = b + a    // Add an element to the running total
+        |  def merge(b1: Int, b2: Int) = b1 + b2 // Merge intermediate values.
+        |  def finish(b: Int) = b                // Return the final result.
+        |  def bufferEncoder: Encoder[Int] = Encoders.scalaInt
+        |  def outputEncoder: Encoder[Int] = Encoders.scalaInt
+        |}.toColumn
+        |
+        |val ds = Seq(1, 2, 3, 4).toDS()
+        |ds.select(simpleSum).collect
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
   }
 
   test("SPARK-2632 importing a method from non serializable class and not using it.") {
-    val output = runInterpreter("local",
-    """
+    val output = runInterpreter("local-cluster[1,1,1024]",
+      """
       |class TestClass() { def testMethod = 3 }
       |val t = new TestClass
       |import t.testMethod
       |case class TestCaseClass(value: Int)
-      |sc.parallelize(1 to 10).map(x => TestCaseClass(x)).collect
+      |sc.parallelize(1 to 10).map(x => TestCaseClass(x)).collect()
     """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
   }
 
-  if (System.getenv("MESOS_NATIVE_LIBRARY") != null) {
+  if (System.getenv("MESOS_NATIVE_JAVA_LIBRARY") != null) {
     test("running on Mesos") {
       val output = runInterpreter("localquiet",
         """
           |var v = 7
           |def getV() = v
-          |sc.parallelize(1 to 10).map(x => getV()).collect.reduceLeft(_+_)
+          |sc.parallelize(1 to 10).map(x => getV()).collect().reduceLeft(_+_)
           |v = 10
-          |sc.parallelize(1 to 10).map(x => getV()).collect.reduceLeft(_+_)
+          |sc.parallelize(1 to 10).map(x => getV()).collect().reduceLeft(_+_)
           |var array = new Array[Int](5)
           |val broadcastArray = sc.broadcast(array)
-          |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect
+          |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect()
           |array(0) = 5
-          |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect
+          |sc.parallelize(0 to 4).map(x => broadcastArray.value(x)).collect()
         """.stripMargin)
       assertDoesNotContain("error:", output)
       assertDoesNotContain("Exception", output)
@@ -317,10 +376,77 @@ class ReplSuite extends FunSuite {
     val output = runInterpreter("local[2]",
       """
         |case class Foo(i: Int)
-        |val ret = sc.parallelize((1 to 100).map(Foo), 10).collect
+        |val ret = sc.parallelize((1 to 100).map(Foo), 10).collect()
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
     assertContains("ret: Array[Foo] = Array(Foo(1),", output)
+  }
+
+  test("collecting objects of class defined in repl - shuffling") {
+    val output = runInterpreter("local-cluster[1,1,1024]",
+      """
+        |case class Foo(i: Int)
+        |val list = List((1, Foo(1)), (1, Foo(2)))
+        |val ret = sc.parallelize(list).groupByKey().collect()
+      """.stripMargin)
+    assertDoesNotContain("error:", output)
+    assertDoesNotContain("Exception", output)
+    assertContains("ret: Array[(Int, Iterable[Foo])] = Array((1,", output)
+  }
+
+  test("line wrapper only initialized once when used as encoder outer scope") {
+    val output = runInterpreter("local",
+      """
+        |val fileName = "repl-test-" + System.currentTimeMillis
+        |val tmpDir = System.getProperty("java.io.tmpdir")
+        |val file = new java.io.File(tmpDir, fileName)
+        |def createFile(): Unit = file.createNewFile()
+        |
+        |createFile();case class TestCaseClass(value: Int)
+        |sc.parallelize(1 to 10).map(x => TestCaseClass(x)).collect()
+        |
+        |file.delete()
+      """.stripMargin)
+    assertDoesNotContain("error:", output)
+    assertDoesNotContain("Exception", output)
+  }
+
+  test("define case class and create Dataset together with paste mode") {
+    val output = runInterpreterInPasteMode("local-cluster[1,1,1024]",
+      """
+        |import spark.implicits._
+        |case class TestClass(value: Int)
+        |Seq(TestClass(1)).toDS()
+      """.stripMargin)
+    assertDoesNotContain("error:", output)
+    assertDoesNotContain("Exception", output)
+  }
+
+  test("should clone and clean line object in ClosureCleaner") {
+    val output = runInterpreterInPasteMode("local-cluster[1,4,4096]",
+      """
+        |import org.apache.spark.rdd.RDD
+        |
+        |val lines = sc.textFile("pom.xml")
+        |case class Data(s: String)
+        |val dataRDD = lines.map(line => Data(line.take(3)))
+        |dataRDD.cache.count
+        |val repartitioned = dataRDD.repartition(dataRDD.partitions.size)
+        |repartitioned.cache.count
+        |
+        |def getCacheSize(rdd: RDD[_]) = {
+        |  sc.getRDDStorageInfo.filter(_.id == rdd.id).map(_.memSize).sum
+        |}
+        |val cacheSize1 = getCacheSize(dataRDD)
+        |val cacheSize2 = getCacheSize(repartitioned)
+        |
+        |// The cache size of dataRDD and the repartitioned one should be similar.
+        |val deviation = math.abs(cacheSize2 - cacheSize1).toDouble / cacheSize1
+        |assert(deviation < 0.2,
+        |  s"deviation too large: $deviation, first size: $cacheSize1, second size: $cacheSize2")
+      """.stripMargin)
+    assertDoesNotContain("AssertionError", output)
+    assertDoesNotContain("Exception", output)
   }
 }
